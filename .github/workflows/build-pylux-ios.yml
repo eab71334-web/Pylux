@@ -21,7 +21,10 @@ jobs:
       - name: Build chiaki-lib (device + simulator)
         working-directory: ios
         run: |
-          sed '/^# --- Main ---/,$d' build.sh > ci_build_lib.sh
+          sed -e '/^# --- Main ---/,$d' \
+              -e 's|^CMAKE_EXTRA=.*|CMAKE_EXTRA="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DUSE_NGHTTP2=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF"|' \
+              build.sh > ci_build_lib.sh
+          grep -n '^CMAKE_EXTRA' ci_build_lib.sh
           echo 'build_lib' >> ci_build_lib.sh
           bash ci_build_lib.sh
 
