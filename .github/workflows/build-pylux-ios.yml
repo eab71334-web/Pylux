@@ -1,0 +1,50 @@
+name: Build Pylux iOS (unsigned IPA)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install ninja protobuf@29 || brew install ninja protobuf
+
+      # Reuses build_lib() from ios/build.sh without running its main section
+      - name: Build chiaki-lib (device + simulator)
+        working-directory: ios
+        run: |
+          sed '/^# --- Main ---/,$d' build.sh > ci_build_lib.sh
+          echo 'build_lib' >> ci_build_lib.sh
+          bash ci_build_lib.sh
+
+      - name: Build app without code signing
+        working-directory: ios
+        run: |
+          xcodebuild -project Pylux.xcodeproj -scheme Pylux -sdk iphoneos \
+            -configuration Release build \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build-derived \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet
+
+      - name: Package IPA
+        working-directory: ios
+        run: |
+          APP=$(find build-derived/Build/Products -type d -name Pylux.app | head -n 1)
+          echo "App bundle: $APP"
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qr Pylux-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pylux-ios-ipa
+          path: ios/Pylux-unsigned.ipa
