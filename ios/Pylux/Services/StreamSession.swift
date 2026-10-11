@@ -172,6 +172,7 @@ final class StreamSession: ObservableObject {
         rumbleEffectsEnabled = resumePrefs.rumbleEnabled
         rumbleIntensity = resumePrefs.rumbleIntensity
         state = .connecting
+        CloudStationGate.shared.streamStarted()
         if connectInfo.isPsnConnection {
             connectionPhase = "Preparing internet connection…"
         } else if connectInfo.isCloudConnection {
@@ -239,6 +240,7 @@ final class StreamSession: ObservableObject {
         // Do NOT nil videoDecoder here: session callback may still run until chiaki_session_bridge_join
         // completes. The join task (started in createAndStartSession/createAndStartSessionSync) will nil it.
         connectionPhase = ""
+        CloudStationGate.shared.streamStopped()
         state = .idle
     }
 
@@ -435,6 +437,7 @@ final class StreamSession: ObservableObject {
             let quitMsg = quitReasonStr ?? String(format: "reason=0x%08x", event.quit_reason)
             os_log(.error, log: sessionLog, "[StreamSession] Session quit: %{public}s", quitMsg)
             state = .quit(reason: event.quit_reason, reasonString: quitReasonStr)
+            CloudStationGate.shared.streamStopped()
         case 1: // ChiakiSessionBridgeEventLoginPinRequest
             connectionPhase = ""
             state = .loginPinRequest(pinIncorrect: event.login_pin_incorrect)
