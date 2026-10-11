@@ -11,6 +11,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      # Safety net: if SecureStore.swift was overwritten by a wrong paste (it then contains
+      # StreamSession code), restore the last good version from this repo's own git history.
+      - name: Restore SecureStore.swift if it was overwritten
+        run: |
+          f=ios/Pylux/Services/SecureStore.swift
+          if grep -q "struct StreamConnectInfo" "$f" || ! grep -qE "(class|struct|enum) SecureStore" "$f"; then
+            echo "SecureStore.swift looks wrong, searching history for a good copy..."
+            for c in $(git log --format=%H -- "$f"); do
+              if git show "$c:$f" | grep -qE "(class|struct|enum) SecureStore" && ! git show "$c:$f" | grep -q "struct StreamConnectInfo"; then
+                git show "$c:$f" > "$f"
+                echo "Restored $f from commit $c"
+                break
+              fi
+            done
+          else
+            echo "SecureStore.swift looks fine"
+          fi
+          grep -cE "(class|struct|enum) SecureStore" "$f" || true
 
       - name: Install build tools
         run: |
