@@ -115,6 +115,8 @@ final class StreamSession: ObservableObject {
     }
     private var adaptiveTriggersEnabled: Bool
     private var streamPrefsObserver: NSObjectProtocol?
+    /// CloudStation-4: stops the stream when the server bans/deletes this user.
+    private var revokeObserver: NSObjectProtocol?
 
     init(connectInfo: StreamConnectInfo, input: StreamInput) {
         self.connectInfo = connectInfo
@@ -126,6 +128,15 @@ final class StreamSession: ObservableObject {
         input.controllerStateChangedCallback = { [weak self] statePtr in
             guard let self = self, let ref = self.sessionRef else { return }
             _ = chiaki_session_bridge_set_controller_state(ref, statePtr)
+        }
+        revokeObserver = NotificationCenter.default.addObserver(
+            forName: .cloudStationRevoked,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.shutdown()
+            }
         }
         streamPrefsObserver = NotificationCenter.default.addObserver(
             forName: .streamPreferencesDidChange,
@@ -147,6 +158,9 @@ final class StreamSession: ObservableObject {
 
     deinit {
         if let obs = streamPrefsObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        if let obs = revokeObserver {
             NotificationCenter.default.removeObserver(obs)
         }
     }
