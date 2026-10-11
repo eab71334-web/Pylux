@@ -31,12 +31,17 @@ jobs:
       - name: Build app without code signing
         working-directory: ios
         run: |
+          set -o pipefail
           xcodebuild -project Pylux.xcodeproj -scheme Pylux -sdk iphoneos \
             -configuration Release build \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build-derived \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            -quiet
+            -quiet 2>&1 | tee build.log || {
+              echo "=================== ERRORS ONLY ==================="
+              grep -n "error:" build.log | sed 's#/Users/runner/work/Pylux/Pylux/ios/##' | head -40
+              exit 1
+            }
 
       - name: Package IPA
         working-directory: ios
