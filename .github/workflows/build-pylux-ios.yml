@@ -39,7 +39,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             -quiet 2>&1 | tee build.log || {
               echo "=================== ERRORS ONLY ==================="
-              grep -n "error:" build.log | sed 's#/Users/runner/work/Pylux/Pylux/ios/##' | head -40
+              grep "error:" build.log | sed 's#/Users/runner/work/Pylux/Pylux/ios/Pylux/##' | sed 's#: error: #\n   >> #' | awk '!seen[$0]++' | head -45 | fold -s -w 42
+              echo "=================== END ==================="
               exit 1
             }
 
