@@ -49,6 +49,7 @@ final class CloudStationGate: ObservableObject {
 
     private var sessionId: Int?
     private var pingTask: Task<Void, Never>?
+    private var isStreaming = false
 
     private var token: String? {
         get { UserDefaults.standard.string(forKey: Self.tokenKey) }
@@ -109,17 +110,32 @@ final class CloudStationGate: ObservableObject {
         }
     }
 
-    // MARK: Session reporting (hours played, online status)
+    // MARK: Reporting
+    // While idle the app only checks every 20s that the user is still allowed (ban / delete).
+    // While a stream is running it also keeps a session open on the server (hours played).
+
+    /// Called by StreamSession when a stream starts.
+    func streamStarted() {
+        guard isAuthorized else { return }
+        isStreaming = true
+        if sessionId == nil {
+            Task { await self.beginSession() }
+        }
+    }
+
+    /// Called by StreamSession when a stream stops (safe to call more than once).
+    func streamStopped() {
+        isStreaming = false
+        endSession()
+    }
 
     private func startReporting() {
         guard isAuthorized, pingTask == nil else { return }
         pingTask = Task { [weak self] in
             guard let self = self else { return }
-            await self.beginSession()
             while !Task.isCancelled {
+                await self.tick()
                 try? await Task.sleep(nanoseconds: 20_000_000_000)
-                if Task.isCancelled { break }
-                await self.ping()
             }
         }
     }
@@ -127,19 +143,35 @@ final class CloudStationGate: ObservableObject {
     private func stopReporting() {
         pingTask?.cancel()
         pingTask = nil
-        if let sid = sessionId {
-            sessionId = nil
-            Task { _ = await self.request("/api/session/end", body: ["sessionId": sid]) }
+        endSession()
+    }
+
+    private func tick() async {
+        if isStreaming {
+            await ping()
+        } else {
+            await checkMe()
         }
     }
 
+    private func endSession() {
+        guard let sid = sessionId else { return }
+        sessionId = nil
+        Task { _ = await self.request("/api/session/end", body: ["sessionId": sid]) }
+    }
+
+    private func revokeMessage(_ obj: [String: Any]) -> String {
+        (obj["error"] as? String) == "banned" ? "Your access was suspended" : "Access removed"
+    }
+
     private func beginSession() async {
+        guard sessionId == nil else { return }
         guard let (status, obj) = await request("/api/session/start") else { return }
         if status == 401 || status == 403 {
-            revoke(message: (obj["error"] as? String) == "banned" ? "Your access was suspended" : "Access removed")
+            revoke(message: revokeMessage(obj))
             return
         }
-        if status == 200 { sessionId = obj["sessionId"] as? Int }
+        if status == 200, isStreaming { sessionId = obj["sessionId"] as? Int }
     }
 
     private func ping() async {
@@ -149,23 +181,24 @@ final class CloudStationGate: ObservableObject {
         }
         guard let (status, obj) = await request("/api/session/ping", body: ["sessionId": sid]) else { return }
         if status == 401 || status == 403 {
-            revoke(message: (obj["error"] as? String) == "banned" ? "Your access was suspended" : "Access removed")
+            revoke(message: revokeMessage(obj))
             return
         }
         if status == 200 { muted = (obj["muted"] as? Bool) ?? false }
     }
 
-    private func validateOnLaunch() async {
-        guard let (status, obj) = await request("/api/me", method: "GET") else {
-            startReporting() // offline: keep going, the ping loop will enforce later
-            return
-        }
+    private func checkMe() async {
+        guard let (status, obj) = await request("/api/me", method: "GET") else { return }
         if status == 401 || status == 403 {
-            revoke(message: (obj["error"] as? String) == "banned" ? "Your access was suspended" : "Access removed")
-        } else {
+            revoke(message: revokeMessage(obj))
+        } else if status == 200 {
             muted = (obj["muted"] as? Bool) ?? false
-            startReporting()
         }
+    }
+
+    private func validateOnLaunch() async {
+        await checkMe()
+        if isAuthorized { startReporting() }
     }
 
     /// Server said the user is banned/deleted: clear the token, stop everything, show the code screen.
@@ -173,6 +206,7 @@ final class CloudStationGate: ObservableObject {
         pingTask?.cancel()
         pingTask = nil
         sessionId = nil
+        isStreaming = false
         token = nil
         errorMessage = message
         isAuthorized = false
