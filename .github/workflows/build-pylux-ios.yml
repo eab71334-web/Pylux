@@ -32,6 +32,25 @@ jobs:
           fi
           grep -cE "(class|struct|enum) SecureStore" "$f" || true
 
+      # CloudStation-4: let the relay code reach the live HostStore (adds two lines to HostModels.swift at build time).
+      - name: Patch HostModels.swift (expose the live HostStore)
+        run: |
+          python3 - <<'PY'
+          p = "ios/Pylux/Models/HostModels.swift"
+          s = open(p).read()
+          if "static weak var current" in s:
+              print("HostModels.swift already patched")
+          else:
+              a = "    private let store = SecureStore.shared\n"
+              b = "    init() {\n        loadFromDisk()"
+              assert a in s, "anchor 1 not found in HostModels.swift"
+              assert b in s, "anchor 2 not found in HostModels.swift"
+              s = s.replace(a, a + "    static weak var current: HostStore?\n", 1)
+              s = s.replace(b, "    init() {\n        HostStore.current = self\n        loadFromDisk()", 1)
+              open(p, "w").write(s)
+              print("HostModels.swift patched")
+          PY
+
       - name: Install build tools
         run: |
           export HOMEBREW_NO_AUTO_UPDATE=1
