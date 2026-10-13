@@ -51,6 +51,54 @@ jobs:
               print("HostModels.swift patched")
           PY
 
+      # Branding: if the repo has a branding/ folder, apply the app name and icons at build time.
+      #   branding/app_name.txt  -> one line with the app name
+      #   branding/icon.png      -> square app icon (any size, ideally 1024x1024)
+      #   branding/logo.png      -> wide logo shown at the top of the app (optional)
+      - name: Apply branding (name and icons)
+        run: |
+          B=branding
+          if [ ! -d "$B" ]; then echo "No branding folder, skipping"; exit 0; fi
+          PLIST=ios/Pylux/Info.plist
+          setkey() {
+            /usr/libexec/PlistBuddy -c "Set :$1 \"$2\"" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$1 string \"$2\"" "$PLIST"
+          }
+          if [ -f "$B/app_name.txt" ]; then
+            NAME="$(tr -d '\r\n' < "$B/app_name.txt")"
+            echo "App name: $NAME"
+            setkey CFBundleDisplayName "$NAME"
+            setkey CFBundleName "$NAME"
+            sed -i '' "s/Text(\"CloudStation-4\")/Text(\"$NAME\")/" ios/Pylux/App/PyluxApp.swift
+          fi
+          if [ -f "$B/icon.png" ]; then
+            D=ios/Pylux/Assets.xcassets/AppIcon.appiconset
+            rm -rf "$D"; mkdir -p "$D"
+            sips -z 1024 1024 "$B/icon.png" --out "$D/AppIcon.png"
+            cat > "$D/Contents.json" <<'JSON'
+          {
+            "images" : [
+              { "filename" : "AppIcon.png", "idiom" : "universal", "platform" : "ios", "size" : "1024x1024" }
+            ],
+            "info" : { "author" : "xcode", "version" : 1 }
+          }
+          JSON
+            echo "App icon replaced"
+          fi
+          if [ -f "$B/logo.png" ]; then
+            D=ios/Pylux/Assets.xcassets/PyluxLogo.imageset
+            rm -rf "$D"; mkdir -p "$D"
+            cp "$B/logo.png" "$D/PyluxLogo.png"
+            cat > "$D/Contents.json" <<'JSON'
+          {
+            "images" : [
+              { "filename" : "PyluxLogo.png", "idiom" : "universal" }
+            ],
+            "info" : { "author" : "xcode", "version" : 1 }
+          }
+          JSON
+            echo "Logo replaced"
+          fi
+
       - name: Install build tools
         run: |
           export HOMEBREW_NO_AUTO_UPDATE=1
