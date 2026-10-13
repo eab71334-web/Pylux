@@ -150,9 +150,14 @@ final class CloudStationGate: ObservableObject {
             return
         }
         remoteProxy = proxy
-        remoteConsole = RemoteConsole(json: cobj)
+        let console = RemoteConsole(json: cobj)
+        remoteConsole = console
         remoteActive = true
-        remoteStatus = "Connecting to host…"
+        if addRemoteConsoleToPylux(console) {
+            remoteStatus = "Ready: tap the 127.0.0.1 console in the list"
+        } else {
+            remoteStatus = "Connected, but the console could not be added to the list"
+        }
     }
 
     func stopRemote() {
@@ -160,12 +165,47 @@ final class CloudStationGate: ObservableObject {
         remoteProxy = nil
         remoteActive = false
         remoteStatus = ""
+        removeRemoteConsoleFromPylux()
+    }
+
+    /// Adds the host's PS4 (credentials received from the server) to Pylux's list as a manual console
+    /// at 127.0.0.1, which is where the local relay proxy listens.
+    private func addRemoteConsoleToPylux(_ c: RemoteConsole) -> Bool {
+        guard let store = HostStore.current,
+              let mac = csDataFromHex(c.macHex), mac.count == 6,
+              let registKey = csDataFromHex(c.registKeyHex),
+              let rpKey = csDataFromHex(c.rpKeyHex) else { return false }
+        let reg = RegisteredHost(
+            target: c.target,
+            serverMac: mac,
+            serverNickname: c.nickname,
+            rpRegistKey: registKey,
+            rpKeyType: c.rpKeyType,
+            rpKey: rpKey
+        )
+        store.addRegisteredHost(reg)
+        guard let saved = store.registeredHosts.first(where: { $0.serverMacString == reg.serverMacString }) else {
+            return false
+        }
+        for m in store.manualHosts where m.host == "127.0.0.1" {
+            store.deleteManualHost(m)
+        }
+        store.addManualHost(ManualHost(host: "127.0.0.1", registeredHostId: saved.id))
+        return true
+    }
+
+    private func removeRemoteConsoleFromPylux() {
+        guard let store = HostStore.current else { return }
+        for m in store.manualHosts where m.host == "127.0.0.1" {
+            store.deleteManualHost(m)
+        }
     }
 
     private func remoteClosed(_ reason: String) {
         remoteProxy?.stop()
         remoteProxy = nil
         remoteActive = false
+        removeRemoteConsoleFromPylux()
         if reason == "access revoked" {
             revoke(message: "Your access was suspended")
         } else {
@@ -397,6 +437,23 @@ private func parseRelayFrame(_ d: Data) -> (RelayFrameType, UInt16, Data)? {
     guard d.count >= 3, let t = RelayFrameType(rawValue: d[d.startIndex]) else { return nil }
     let id = (UInt16(d[d.startIndex + 1]) << 8) | UInt16(d[d.startIndex + 2])
     return (t, id, d.subdata(in: (d.startIndex + 3)..<d.endIndex))
+}
+
+private func csHexString(_ d: Data) -> String {
+    d.map { String(format: "%02x", $0) }.joined()
+}
+
+private func csDataFromHex(_ hex: String) -> Data? {
+    let chars = Array(hex)
+    guard !chars.isEmpty, chars.count % 2 == 0 else { return nil }
+    var out = Data()
+    var i = 0
+    while i < chars.count {
+        guard let b = UInt8(String(chars[i...i + 1]), radix: 16) else { return nil }
+        out.append(b)
+        i += 2
+    }
+    return out
 }
 
 private func relayWsURL(_ path: String) -> URL? {
@@ -827,8 +884,13 @@ struct RemoteOverlay: View {
 
 // MARK: - Host mode screen (for the owner's iPhone next to the PS4)
 
+@MainActor
 final class HostModeModel: ObservableObject {
+    /// One shared instance so hosting keeps running after the Host screen is closed.
+    static let shared = HostModeModel()
+
     @Published var status = "Stopped"
+    @Published var consoleStatus = ""
     @Published var running = false
     private var host: RelayHost?
 
@@ -836,12 +898,13 @@ final class HostModeModel: ObservableObject {
         stop()
         let h = RelayHost(ps4Host: ps4Host, hostKey: hostKey)
         h.onStatus = { [weak self] s in
-            DispatchQueue.main.async { self?.status = s }
+            Task { @MainActor in self?.status = s }
         }
         host = h
         running = true
         UIApplication.shared.isIdleTimerDisabled = true
         h.start()
+        uploadConsole(hostKey: hostKey, ps4Host: ps4Host)
     }
 
     func stop() {
@@ -850,11 +913,61 @@ final class HostModeModel: ObservableObject {
         running = false
         UIApplication.shared.isIdleTimerDisabled = false
     }
+
+    /// Sends the registered PS4's credentials to the server so remote players can be given them.
+    func uploadConsole(hostKey: String, ps4Host: String) {
+        guard let store = HostStore.current else {
+            consoleStatus = "Console not shared: open this from the main screen"
+            return
+        }
+        var picked = store.registeredHosts.first(where: { $0.serverMac.count == 6 })
+        if let hid = store.discoveredHosts.first(where: { $0.hostAddr == ps4Host })?.hostId, hid.count == 12 {
+            let chars = Array(hid)
+            let mac = stride(from: 0, to: 12, by: 2).map { String(chars[$0...$0 + 1]) }.joined(separator: ":").uppercased()
+            if let match = store.registeredHosts.first(where: { $0.serverMacString == mac }) {
+                picked = match
+            }
+        }
+        guard let reg = picked else {
+            consoleStatus = "No registered console found. Register your PS4 in Pylux first."
+            return
+        }
+        let body: [String: Any] = [
+            "nickname": reg.serverNickname ?? "PS4",
+            "mac": csHexString(reg.serverMac),
+            "target": reg.target,
+            "registKey": csHexString(reg.rpRegistKey),
+            "rpKey": csHexString(reg.rpKey),
+            "rpKeyType": reg.rpKeyType,
+        ]
+        let name = reg.serverNickname ?? "PS4"
+        consoleStatus = "Sharing console…"
+        Task {
+            guard let url = URL(string: csServerBase + "/host/console"),
+                  let data = try? JSONSerialization.data(withJSONObject: body) else {
+                self.consoleStatus = "Could not share the console"
+                return
+            }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 60
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(hostKey, forHTTPHeaderField: "x-host-key")
+            req.httpBody = data
+            do {
+                let (_, resp) = try await URLSession.shared.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                self.consoleStatus = code == 200 ? "Console shared: \(name)" : "Could not share the console (\(code))"
+            } catch {
+                self.consoleStatus = "Could not share the console"
+            }
+        }
+    }
 }
 
 struct HostModeView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var model = HostModeModel()
+    @ObservedObject private var model = HostModeModel.shared
     @State private var hostKey = UserDefaults.standard.string(forKey: "cs.hostKey") ?? ""
     @State private var ps4Ip = UserDefaults.standard.string(forKey: "cs.ps4Ip") ?? ""
 
@@ -870,6 +983,11 @@ struct HostModeView: View {
                 }
                 Section(header: Text("Status")) {
                     Text(model.status)
+                    if !model.consoleStatus.isEmpty {
+                        Text(model.consoleStatus)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 Section(footer: Text("Keep this screen open and the phone plugged in while hosting.")) {
                     Button(model.running ? "Stop hosting" : "Start hosting") {
