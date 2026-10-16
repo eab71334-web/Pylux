@@ -26,9 +26,20 @@ jobs:
           sudo apt-get install -y protobuf-compiler ninja-build
           pip install protobuf
 
-      - name: Accept Android SDK licenses
+      # The SDK folder on the runner belongs to root, so Gradle could not install the NDK it needs.
+      # Make it writable, accept the licenses and install the NDK + CMake the project asks for.
+      - name: Prepare Android SDK (permissions, licenses, NDK, CMake)
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$ANDROID_HOME"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          NDK=$(grep -rhoE "ndkVersion[ =]+['\"][0-9.]+['\"]" android --include='*.gradle' --include='*.kts' --include='*.properties' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+          NDK=${NDK:-28.2.13676358}
+          CMK=$(grep -rhoE "version[ =]+['\"]3\.[0-9]+\.[0-9]+['\"]" android --include='*.gradle' --include='*.kts' 2>/dev/null | grep -oE '3\.[0-9]+\.[0-9]+' | head -n 1 || true)
+          CMK=${CMK:-3.22.1}
+          echo "Installing NDK $NDK and CMake $CMK"
+          "$SDKM" "ndk;$NDK" "cmake;$CMK" > /dev/null
+          ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
 
       - name: Write ABI init script
         run: |
