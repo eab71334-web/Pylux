@@ -66,6 +66,367 @@ jobs:
           }
           GRADLE
 
+      # CloudStation-4: adds the access-code screen, ban/delete kick and hours tracking to the Android app.
+      # New Kotlin files are generated here and registered in the manifest; the original app code is not edited.
+      - name: Add CloudStation gate (code screen, ban, hours)
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+
+          # ---- locate the application module ----
+          app_manifest = None
+          for m in glob.glob("android/**/src/main/AndroidManifest.xml", recursive=True):
+              if "<application" in open(m, encoding="utf-8", errors="ignore").read():
+                  app_manifest = m
+                  break
+          if not app_manifest:
+              print("ERROR: no application manifest found under android/")
+              sys.exit(1)
+          mod_dir = os.path.dirname(app_manifest)
+          src_dir = os.path.join(mod_dir, "java", "com", "pylux", "stream", "cloudstation")
+          os.makedirs(src_dir, exist_ok=True)
+          print("App module:", mod_dir)
+
+          GATE = r'''package com.pylux.stream.cloudstation
+
+          import android.app.Activity
+          import android.app.Application
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import org.json.JSONObject
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * CloudStation-4 access gate: the user must enter a code from the owner. While the app is open it
+           * reports a session (hours) and checks every 20s that the user was not banned or deleted.
+           */
+          object CloudStationGate {
+              const val SERVER = "https://cloudstation-server.onrender.com"
+              private const val PREFS = "cloudstation"
+              private const val KEY_TOKEN = "token"
+
+              private val main = Handler(Looper.getMainLooper())
+
+              @Volatile
+              private var appCtx: Context? = null
+
+              @Volatile
+              private var sessionId: Int = -1
+
+              @Volatile
+              private var startedCount: Int = 0
+
+              @Volatile
+              private var generation: Int = 0
+
+              @Volatile
+              var muted: Boolean = false
+                  private set
+
+              fun init(app: Application) {
+                  appCtx = app.applicationContext
+                  app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+                      override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+                          if (activity is CodeGateActivity) return
+                          if (!isAuthorized(activity)) {
+                              activity.startActivity(Intent(activity, CodeGateActivity::class.java))
+                              activity.finish()
+                          }
+                      }
+
+                      override fun onActivityStarted(activity: Activity) {
+                          if (activity is CodeGateActivity) return
+                          startedCount++
+                          if (startedCount == 1) onForeground()
+                      }
+
+                      override fun onActivityStopped(activity: Activity) {
+                          if (activity is CodeGateActivity) return
+                          startedCount--
+                          if (startedCount <= 0) {
+                              startedCount = 0
+                              onBackground()
+                          }
+                      }
+
+                      override fun onActivityResumed(activity: Activity) {}
+                      override fun onActivityPaused(activity: Activity) {}
+                      override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+                      override fun onActivityDestroyed(activity: Activity) {}
+                  })
+              }
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun isAuthorized(ctx: Context): Boolean = prefs(ctx).getString(KEY_TOKEN, null) != null
+
+              private fun token(ctx: Context): String? = prefs(ctx).getString(KEY_TOKEN, null)
+
+              private fun deviceId(ctx: Context): String =
+                  Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) ?: "android-unknown"
+
+              private fun request(ctx: Context, path: String, method: String, body: JSONObject?, auth: Boolean): Pair<Int, JSONObject>? {
+                  return try {
+                      val conn = URL(SERVER + path).openConnection() as HttpURLConnection
+                      conn.requestMethod = method
+                      conn.connectTimeout = 60000
+                      conn.readTimeout = 60000
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      if (auth) {
+                          val t = token(ctx)
+                          if (t != null) conn.setRequestProperty("Authorization", "Bearer " + t)
+                      }
+                      if (body != null) {
+                          conn.doOutput = true
+                          val w = OutputStreamWriter(conn.outputStream, Charsets.UTF_8)
+                          w.write(body.toString())
+                          w.close()
+                      }
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val text = stream?.bufferedReader()?.readText() ?: "{}"
+                      conn.disconnect()
+                      val json = try {
+                          JSONObject(text)
+                      } catch (e: Exception) {
+                          JSONObject()
+                      }
+                      Pair(code, json)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** Checks the code with the server. callback(null) = success, otherwise an error message. Runs on the main thread. */
+              fun redeem(ctx: Context, code: String, callback: (String?) -> Unit) {
+                  Thread {
+                      val body = JSONObject()
+                      body.put("code", code.trim())
+                      body.put("deviceId", deviceId(ctx))
+                      val r = request(ctx, "/api/redeem", "POST", body, false)
+                      val err: String? = if (r == null) {
+                          "No connection"
+                      } else if (r.first == 200 && r.second.has("token")) {
+                          prefs(ctx).edit().putString(KEY_TOKEN, r.second.getString("token")).apply()
+                          muted = r.second.optBoolean("muted", false)
+                          null
+                      } else {
+                          r.second.optString("error", "Error")
+                      }
+                      main.post { callback(err) }
+                  }.start()
+              }
+
+              private fun onForeground() {
+                  val ctx = appCtx ?: return
+                  val myGen = ++generation
+                  Thread {
+                      while (generation == myGen) {
+                          tick(ctx)
+                          try {
+                              Thread.sleep(20000)
+                          } catch (e: InterruptedException) {
+                              break
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun onBackground() {
+                  generation++
+                  val ctx = appCtx ?: return
+                  val sid = sessionId
+                  sessionId = -1
+                  if (sid >= 0) {
+                      Thread {
+                          val body = JSONObject()
+                          body.put("sessionId", sid)
+                          request(ctx, "/api/session/end", "POST", body, true)
+                      }.start()
+                  }
+              }
+
+              private fun isRevoked(r: Pair<Int, JSONObject>) = r.first == 401 || r.first == 403
+
+              private fun tick(ctx: Context) {
+                  if (!isAuthorized(ctx)) return
+                  if (sessionId < 0) {
+                      val r = request(ctx, "/api/session/start", "POST", JSONObject(), true) ?: return
+                      if (isRevoked(r)) {
+                          revoke(ctx, r.second.optString("error"))
+                          return
+                      }
+                      if (r.first == 200) sessionId = r.second.optInt("sessionId", -1)
+                  } else {
+                      val body = JSONObject()
+                      body.put("sessionId", sessionId)
+                      val r = request(ctx, "/api/session/ping", "POST", body, true) ?: return
+                      if (isRevoked(r)) {
+                          revoke(ctx, r.second.optString("error"))
+                          return
+                      }
+                      if (r.first == 200) muted = r.second.optBoolean("muted", false)
+                  }
+              }
+
+              /** The server banned/deleted this user: forget the token and go back to the code screen. */
+              fun revoke(ctx: Context, error: String?) {
+                  generation++
+                  sessionId = -1
+                  prefs(ctx).edit().remove(KEY_TOKEN).apply()
+                  val msg = if (error == "banned") "Your access was suspended" else "Access removed"
+                  main.post {
+                      val i = Intent(ctx, CodeGateActivity::class.java)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                      i.putExtra("msg", msg)
+                      ctx.startActivity(i)
+                  }
+              }
+          }
+          '''
+
+          INIT = r'''package com.pylux.stream.cloudstation
+
+          import android.app.Application
+          import android.content.ContentProvider
+          import android.content.ContentValues
+          import android.database.Cursor
+          import android.net.Uri
+
+          /** Starts the gate automatically when the app process starts (no changes to the original app code needed). */
+          class CloudStationInit : ContentProvider() {
+              override fun onCreate(): Boolean {
+                  val app = context?.applicationContext as? Application
+                  if (app != null) CloudStationGate.init(app)
+                  return true
+              }
+
+              override fun query(uri: Uri, projection: Array<String>?, selection: String?, selectionArgs: Array<String>?, sortOrder: String?): Cursor? = null
+              override fun getType(uri: Uri): String? = null
+              override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+              override fun delete(uri: Uri, selection: String?, selectionArgs: Array<String>?): Int = 0
+              override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<String>?): Int = 0
+          }
+          '''
+
+          ACT = r'''package com.pylux.stream.cloudstation
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class CodeGateActivity : Activity() {
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.gravity = Gravity.CENTER
+                  root.setBackgroundColor(Color.rgb(2, 9, 23))
+                  root.setPadding(dp(28), dp(48), dp(28), dp(28))
+
+                  val title = TextView(this)
+                  title.text = "CloudStation-4"
+                  title.textSize = 28f
+                  title.setTextColor(Color.WHITE)
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  title.gravity = Gravity.CENTER
+                  root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  val input = EditText(this)
+                  input.hint = "Access Code"
+                  input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                  input.gravity = Gravity.CENTER
+                  input.textSize = 20f
+                  input.setTextColor(Color.WHITE)
+                  input.setHintTextColor(Color.GRAY)
+                  val inputLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  inputLp.topMargin = dp(28)
+                  root.addView(input, inputLp)
+
+                  val error = TextView(this)
+                  error.setTextColor(Color.rgb(255, 90, 90))
+                  error.gravity = Gravity.CENTER
+                  error.text = intent.getStringExtra("msg") ?: ""
+                  val errorLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  errorLp.topMargin = dp(8)
+                  root.addView(error, errorLp)
+
+                  val button = Button(this)
+                  button.text = "Enter"
+                  val buttonLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  buttonLp.topMargin = dp(16)
+                  button.setOnClickListener {
+                      val code = input.text.toString()
+                      if (code.isBlank()) return@setOnClickListener
+                      button.isEnabled = false
+                      error.text = ""
+                      CloudStationGate.redeem(this, code) { err ->
+                          button.isEnabled = true
+                          if (err != null) {
+                              error.text = err
+                          } else {
+                              val launch = packageManager.getLaunchIntentForPackage(packageName)
+                              if (launch != null) {
+                                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                                  startActivity(launch)
+                              }
+                              finish()
+                          }
+                      }
+                  }
+                  root.addView(button, buttonLp)
+
+                  setContentView(root)
+              }
+          }
+          '''
+
+          for name, text in (("CloudStationGate.kt", GATE), ("CloudStationInit.kt", INIT), ("CodeGateActivity.kt", ACT)):
+              open(os.path.join(src_dir, name), "w", encoding="utf-8").write(text)
+              print("wrote", name)
+
+          # ---- register the provider and the activity in the manifest ----
+          man = open(app_manifest, encoding="utf-8").read()
+          if "CloudStationInit" in man:
+              print("Manifest already patched")
+          else:
+              snippet = (
+                  '\n        <provider\n'
+                  '            android:name="com.pylux.stream.cloudstation.CloudStationInit"\n'
+                  '            android:authorities="${applicationId}.cloudstation"\n'
+                  '            android:exported="false" />\n'
+                  '        <activity\n'
+                  '            android:name="com.pylux.stream.cloudstation.CodeGateActivity"\n'
+                  '            android:exported="false"\n'
+                  '            android:theme="@android:style/Theme.Material.NoActionBar" />\n'
+              )
+              idx = man.rfind("</application>")
+              if idx < 0:
+                  print("ERROR: </application> not found in the manifest")
+                  sys.exit(1)
+              man = man[:idx] + snippet + man[idx:]
+              open(app_manifest, "w", encoding="utf-8").write(man)
+              print("Manifest patched")
+          PY
+
       - name: Build debug APK
         working-directory: android
         run: |
