@@ -126,6 +126,9 @@ jobs:
               private var generation: Int = 0
 
               @Volatile
+              private var streaming: Boolean = false
+
+              @Volatile
               var muted: Boolean = false
                   private set
 
@@ -240,6 +243,10 @@ jobs:
 
               private fun onBackground() {
                   generation++
+                  endSession()
+              }
+
+              private fun endSession() {
                   val ctx = appCtx ?: return
                   val sid = sessionId
                   sessionId = -1
@@ -252,21 +259,48 @@ jobs:
                   }
               }
 
+              /** Called by the stream code when a stream starts: hours are counted only while streaming. */
+              fun streamStarted() {
+                  streaming = true
+                  val ctx = appCtx ?: return
+                  Thread { startSessionIfNeeded(ctx) }.start()
+              }
+
+              /** Called by the stream code when a stream stops (safe to call more than once). */
+              fun streamStopped() {
+                  streaming = false
+                  endSession()
+              }
+
+              private fun startSessionIfNeeded(ctx: Context) {
+                  if (sessionId >= 0 || !isAuthorized(ctx)) return
+                  val r = request(ctx, "/api/session/start", "POST", JSONObject(), true) ?: return
+                  if (isRevoked(r)) {
+                      revoke(ctx, r.second.optString("error"))
+                      return
+                  }
+                  if (r.first == 200 && streaming) sessionId = r.second.optInt("sessionId", -1)
+              }
+
               private fun isRevoked(r: Pair<Int, JSONObject>) = r.first == 401 || r.first == 403
 
               private fun tick(ctx: Context) {
                   if (!isAuthorized(ctx)) return
-                  if (sessionId < 0) {
-                      val r = request(ctx, "/api/session/start", "POST", JSONObject(), true) ?: return
-                      if (isRevoked(r)) {
-                          revoke(ctx, r.second.optString("error"))
-                          return
+                  if (streaming) {
+                      if (sessionId < 0) {
+                          startSessionIfNeeded(ctx)
+                      } else {
+                          val body = JSONObject()
+                          body.put("sessionId", sessionId)
+                          val r = request(ctx, "/api/session/ping", "POST", body, true) ?: return
+                          if (isRevoked(r)) {
+                              revoke(ctx, r.second.optString("error"))
+                              return
+                          }
+                          if (r.first == 200) muted = r.second.optBoolean("muted", false)
                       }
-                      if (r.first == 200) sessionId = r.second.optInt("sessionId", -1)
                   } else {
-                      val body = JSONObject()
-                      body.put("sessionId", sessionId)
-                      val r = request(ctx, "/api/session/ping", "POST", body, true) ?: return
+                      val r = request(ctx, "/api/me", "GET", null, true) ?: return
                       if (isRevoked(r)) {
                           revoke(ctx, r.second.optString("error"))
                           return
@@ -279,6 +313,7 @@ jobs:
               fun revoke(ctx: Context, error: String?) {
                   generation++
                   sessionId = -1
+                  streaming = false
                   prefs(ctx).edit().remove(KEY_TOKEN).apply()
                   val msg = if (error == "banned") "Your access was suspended" else "Access removed"
                   main.post {
@@ -425,6 +460,39 @@ jobs:
               man = man[:idx] + snippet + man[idx:]
               open(app_manifest, "w", encoding="utf-8").write(man)
               print("Manifest patched")
+          PY
+
+      # Count hours only while a stream is running (3 small lines added to StreamSession.kt at build time).
+      - name: Hook hours into StreamSession
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+
+          files = glob.glob("android/**/session/StreamSession.kt", recursive=True)
+          if not files:
+              print("ERROR: StreamSession.kt not found")
+              sys.exit(1)
+          p = files[0]
+          s = open(p, encoding="utf-8").read()
+          CALL_START = "com.pylux.stream.cloudstation.CloudStationGate.streamStarted()"
+          CALL_STOP = "com.pylux.stream.cloudstation.CloudStationGate.streamStopped()"
+          if "CloudStationGate" in s:
+              print("StreamSession.kt already patched")
+              sys.exit(0)
+
+          def insert_after(src, anchor_regex, call, what):
+              pat = re.compile(r"(?m)^([ \t]*)(" + anchor_regex + r")[ \t]*\r?\n")
+              m = pat.search(src)
+              if not m:
+                  print("ERROR: anchor not found for", what)
+                  sys.exit(1)
+              return src[:m.end()] + m.group(1) + call + "\n" + src[m.end():]
+
+          s = insert_after(s, r"_state\.value = StreamStateConnecting", CALL_START, "start")
+          s = insert_after(s, r'Log\.i\("StreamSession", "shutdown: session=\$\{session != null\}"\)', CALL_STOP, "shutdown")
+          s = insert_after(s, r'Log\.i\("StreamSession", "EVENT: Quit reason=\$\{event\.reason\} str=\$\{event\.reasonString\}"\)', CALL_STOP, "quit")
+          open(p, "w", encoding="utf-8").write(s)
+          print("Hours tracking hooked into", p)
           PY
 
       - name: Build debug APK
