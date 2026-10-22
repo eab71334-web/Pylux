@@ -462,6 +462,966 @@ jobs:
               print("Manifest patched")
           PY
 
+      # CloudStation-4: Remote button (play over the internet through the server) and Host mode (owner's phone next to the PS4).
+      - name: Add CloudStation relay (Remote and Host mode)
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+
+          app_manifest = None
+          for m in glob.glob("android/**/src/main/AndroidManifest.xml", recursive=True):
+              if "<application" in open(m, encoding="utf-8", errors="ignore").read():
+                  app_manifest = m
+                  break
+          if not app_manifest:
+              print("ERROR: no application manifest found under android/")
+              sys.exit(1)
+          mod_dir = os.path.dirname(app_manifest)
+          module_root = os.path.dirname(os.path.dirname(mod_dir))
+          src_dir = os.path.join(mod_dir, "java", "com", "pylux", "stream", "cloudstation")
+          os.makedirs(src_dir, exist_ok=True)
+
+          RELAY = r'''package com.pylux.stream.cloudstation
+
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.Response
+          import okhttp3.WebSocket
+          import okhttp3.WebSocketListener
+          import okio.ByteString
+          import org.json.JSONObject
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.net.SocketAddress
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.LinkedBlockingQueue
+          import java.util.concurrent.TimeUnit
+
+          /** Binary frame: [type:1][id:2 big-endian][payload]. The server forwards frames untouched. */
+          object RelayProto {
+              const val TCP_OPEN = 1
+              const val TCP_DATA = 2
+              const val TCP_CLOSE = 3
+              const val UDP_DATA = 4
+
+              fun frame(type: Int, id: Int, payload: ByteArray = ByteArray(0)): ByteArray {
+                  val out = ByteArray(3 + payload.size)
+                  out[0] = type.toByte()
+                  out[1] = ((id shr 8) and 0xFF).toByte()
+                  out[2] = (id and 0xFF).toByte()
+                  System.arraycopy(payload, 0, out, 3, payload.size)
+                  return out
+              }
+          }
+
+          class RelayFrame(val type: Int, val id: Int, val payload: ByteArray) {
+              companion object {
+                  fun parse(d: ByteArray): RelayFrame? {
+                      if (d.size < 3) return null
+                      val type = d[0].toInt() and 0xFF
+                      val id = ((d[1].toInt() and 0xFF) shl 8) or (d[2].toInt() and 0xFF)
+                      return RelayFrame(type, id, d.copyOfRange(3, d.size))
+                  }
+              }
+          }
+
+          /** Small wrapper around an OkHttp WebSocket. */
+          class RelaySocket(
+              private val url: String,
+              private val headers: Map<String, String>,
+              private val onBinary: (ByteArray) -> Unit,
+              private val onText: (String) -> Unit,
+              private val onClosedCb: (String) -> Unit
+          ) {
+              companion object {
+                  val client: OkHttpClient = OkHttpClient.Builder()
+                      .readTimeout(0, TimeUnit.MILLISECONDS)
+                      .pingInterval(20, TimeUnit.SECONDS)
+                      .build()
+              }
+
+              @Volatile
+              private var ws: WebSocket? = null
+
+              @Volatile
+              private var finished = false
+
+              fun connect() {
+                  val builder = Request.Builder().url(url)
+                  for ((k, v) in headers) builder.addHeader(k, v)
+                  ws = client.newWebSocket(builder.build(), object : WebSocketListener() {
+                      override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                          onBinary(bytes.toByteArray())
+                      }
+
+                      override fun onMessage(webSocket: WebSocket, text: String) {
+                          onText(text)
+                      }
+
+                      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                          webSocket.close(1000, null)
+                          finish(reason)
+                      }
+
+                      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                          finish(reason)
+                      }
+
+                      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                          finish(t.message ?: "connection failed")
+                      }
+                  })
+              }
+
+              fun send(data: ByteArray) {
+                  ws?.send(ByteString.of(*data))
+              }
+
+              fun close() {
+                  finished = true
+                  ws?.close(1000, null)
+              }
+
+              private fun finish(reason: String) {
+                  if (finished) return
+                  finished = true
+                  onClosedCb(reason)
+              }
+          }
+
+          /** Runs on the phone next to the PS4: forwards what the remote player sends to the PS4 and back. */
+          class RelayHost(
+              private val ps4Host: String,
+              private val hostKey: String,
+              private val onStatus: (String) -> Unit
+          ) {
+              private class TcpConn {
+                  val out = LinkedBlockingQueue<ByteArray>()
+
+                  @Volatile
+                  var socket: Socket? = null
+              }
+
+              private val tcp = ConcurrentHashMap<Int, TcpConn>()
+              private val udp = ConcurrentHashMap<Int, DatagramSocket>()
+
+              @Volatile
+              private var stopped = true
+
+              @Volatile
+              private var relay: RelaySocket? = null
+
+              fun start() {
+                  stopped = false
+                  connect()
+              }
+
+              fun stop() {
+                  stopped = true
+                  relay?.close()
+                  relay = null
+                  closeAll()
+                  onStatus("Stopped")
+              }
+
+              private fun connect() {
+                  if (stopped) return
+                  onStatus("Connecting to server...")
+                  val url = CloudStationGate.SERVER.replace("https://", "wss://") + "/ws/host"
+                  val r = RelaySocket(
+                      url,
+                      mapOf("x-host-key" to hostKey),
+                      { d -> handleFrame(d) },
+                      { t -> handleControl(t) },
+                      { reason -> closedByServer(reason) }
+                  )
+                  relay = r
+                  r.connect()
+              }
+
+              private fun closedByServer(reason: String) {
+                  relay = null
+                  closeAll()
+                  if (stopped) return
+                  onStatus("Disconnected (" + reason + "). Retrying...")
+                  Thread {
+                      try {
+                          Thread.sleep(5000)
+                      } catch (e: InterruptedException) {
+                      }
+                      connect()
+                  }.start()
+              }
+
+              private fun handleControl(text: String) {
+                  try {
+                      val j = JSONObject(text)
+                      when (j.optString("type")) {
+                          "hello" -> onStatus("Online, waiting for a player")
+                          "client_connected" -> {
+                              closeAll()
+                              onStatus("Player connected: " + j.optString("name"))
+                          }
+                          "client_left" -> {
+                              closeAll()
+                              onStatus("Online, waiting for a player")
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun handleFrame(d: ByteArray) {
+                  val f = RelayFrame.parse(d) ?: return
+                  when (f.type) {
+                      RelayProto.TCP_OPEN -> openTcp(f.id)
+                      RelayProto.TCP_DATA -> tcp[f.id]?.out?.put(f.payload)
+                      RelayProto.TCP_CLOSE -> closeTcp(f.id)
+                      RelayProto.UDP_DATA -> sendUdp(f.id, f.payload)
+                  }
+              }
+
+              private fun openTcp(id: Int) {
+                  val conn = TcpConn()
+                  tcp[id] = conn
+                  Thread {
+                      try {
+                          val s = Socket()
+                          s.connect(InetSocketAddress(ps4Host, 9295), 8000)
+                          s.tcpNoDelay = true
+                          conn.socket = s
+                          val input = s.getInputStream()
+                          val output = s.getOutputStream()
+                          Thread {
+                              try {
+                                  while (true) {
+                                      val d = conn.out.take()
+                                      if (d.isEmpty()) break
+                                      output.write(d)
+                                      output.flush()
+                                  }
+                              } catch (e: Exception) {
+                              }
+                          }.start()
+                          val buf = ByteArray(65536)
+                          while (true) {
+                              val n = input.read(buf)
+                              if (n < 0) break
+                              relay?.send(RelayProto.frame(RelayProto.TCP_DATA, id, buf.copyOf(n)))
+                          }
+                      } catch (e: Exception) {
+                      } finally {
+                          if (tcp.remove(id) != null) relay?.send(RelayProto.frame(RelayProto.TCP_CLOSE, id))
+                          try {
+                              conn.socket?.close()
+                          } catch (e: Exception) {
+                          }
+                          conn.out.offer(ByteArray(0))
+                      }
+                  }.start()
+              }
+
+              private fun closeTcp(id: Int) {
+                  val c = tcp.remove(id) ?: return
+                  try {
+                      c.socket?.close()
+                  } catch (e: Exception) {
+                  }
+                  c.out.offer(ByteArray(0))
+              }
+
+              private fun getUdp(id: Int): DatagramSocket? {
+                  val existing = udp[id]
+                  if (existing != null) return existing
+                  return try {
+                      val ns = DatagramSocket()
+                      ns.connect(InetAddress.getByName(ps4Host), 9296)
+                      udp[id] = ns
+                      Thread {
+                          val buf = ByteArray(65536)
+                          try {
+                              while (true) {
+                                  val p = DatagramPacket(buf, buf.size)
+                                  ns.receive(p)
+                                  relay?.send(RelayProto.frame(RelayProto.UDP_DATA, id, buf.copyOf(p.length)))
+                              }
+                          } catch (e: Exception) {
+                          }
+                      }.start()
+                      ns
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun sendUdp(id: Int, payload: ByteArray) {
+                  val s = getUdp(id) ?: return
+                  try {
+                      s.send(DatagramPacket(payload, payload.size))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun closeAll() {
+                  for (id in tcp.keys.toList()) closeTcp(id)
+                  for (s in udp.values) {
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+                  udp.clear()
+              }
+          }
+
+          /** Runs on the remote player's phone: listens on 127.0.0.1 (9295 TCP, 9296 UDP) like a PS4 would. */
+          class RelayClientProxy(
+              private val token: String,
+              private val ticket: String,
+              private val onClosed: (String) -> Unit
+          ) {
+              private val loopback: InetAddress = InetAddress.getByName("127.0.0.1")
+              private var tcpServer: ServerSocket? = null
+              private var udpSocket: DatagramSocket? = null
+              private val tcp = ConcurrentHashMap<Int, Socket>()
+              private val udpPeers = ConcurrentHashMap<Int, SocketAddress>()
+              private val udpIds = ConcurrentHashMap<SocketAddress, Int>()
+              private var counter = 1
+
+              @Volatile
+              private var stopped = false
+
+              @Volatile
+              private var relay: RelaySocket? = null
+
+              @Synchronized
+              private fun allocId(): Int {
+                  val v = counter
+                  counter = if (counter >= 65535) 1 else counter + 1
+                  return v
+              }
+
+              @Throws(Exception::class)
+              fun start() {
+                  val ts = ServerSocket()
+                  ts.reuseAddress = true
+                  ts.bind(InetSocketAddress(loopback, 9295))
+                  tcpServer = ts
+                  val us = DatagramSocket(null)
+                  us.reuseAddress = true
+                  us.bind(InetSocketAddress(loopback, 9296))
+                  udpSocket = us
+                  val url = CloudStationGate.SERVER.replace("https://", "wss://") + "/ws/client?ticket=" + ticket
+                  val r = RelaySocket(
+                      url,
+                      mapOf("Authorization" to ("Bearer " + token)),
+                      { d -> handleFrame(d) },
+                      { _ -> },
+                      { reason -> finish(reason) }
+                  )
+                  relay = r
+                  r.connect()
+                  Thread { acceptLoop(ts) }.start()
+                  Thread { udpLoop(us) }.start()
+              }
+
+              fun stop() {
+                  stopped = true
+                  relay?.close()
+                  shutdownLocal()
+              }
+
+              private fun finish(reason: String) {
+                  if (stopped) return
+                  stopped = true
+                  shutdownLocal()
+                  onClosed(reason)
+              }
+
+              private fun shutdownLocal() {
+                  try {
+                      tcpServer?.close()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      udpSocket?.close()
+                  } catch (e: Exception) {
+                  }
+                  for (s in tcp.values) {
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+                  tcp.clear()
+              }
+
+              // frames coming from the host (PS4 -> player)
+              private fun handleFrame(d: ByteArray) {
+                  val f = RelayFrame.parse(d) ?: return
+                  when (f.type) {
+                      RelayProto.TCP_DATA -> {
+                          try {
+                              tcp[f.id]?.getOutputStream()?.write(f.payload)
+                          } catch (e: Exception) {
+                          }
+                      }
+                      RelayProto.TCP_CLOSE -> {
+                          val s = tcp.remove(f.id)
+                          try {
+                              s?.close()
+                          } catch (e: Exception) {
+                          }
+                      }
+                      RelayProto.UDP_DATA -> {
+                          val peer = udpPeers[f.id]
+                          if (peer != null) {
+                              try {
+                                  udpSocket?.send(DatagramPacket(f.payload, f.payload.size, peer))
+                              } catch (e: Exception) {
+                              }
+                          }
+                      }
+                  }
+              }
+
+              // local TCP connections from Pylux (player -> PS4)
+              private fun acceptLoop(ts: ServerSocket) {
+                  while (!stopped) {
+                      val s: Socket = try {
+                          ts.accept()
+                      } catch (e: Exception) {
+                          break
+                      }
+                      try {
+                          s.tcpNoDelay = true
+                      } catch (e: Exception) {
+                      }
+                      val id = allocId()
+                      tcp[id] = s
+                      relay?.send(RelayProto.frame(RelayProto.TCP_OPEN, id))
+                      Thread {
+                          try {
+                              val input = s.getInputStream()
+                              val buf = ByteArray(65536)
+                              while (true) {
+                                  val n = input.read(buf)
+                                  if (n < 0) break
+                                  relay?.send(RelayProto.frame(RelayProto.TCP_DATA, id, buf.copyOf(n)))
+                              }
+                          } catch (e: Exception) {
+                          } finally {
+                              if (tcp.remove(id) != null) relay?.send(RelayProto.frame(RelayProto.TCP_CLOSE, id))
+                              try {
+                                  s.close()
+                              } catch (e: Exception) {
+                              }
+                          }
+                      }.start()
+                  }
+              }
+
+              // local UDP datagrams from Pylux (one flow per source port)
+              private fun udpLoop(us: DatagramSocket) {
+                  val buf = ByteArray(65536)
+                  while (!stopped) {
+                      try {
+                          val p = DatagramPacket(buf, buf.size)
+                          us.receive(p)
+                          val peer = p.socketAddress
+                          val id: Int = udpIds[peer] ?: run {
+                              val n = allocId()
+                              udpIds[peer] = n
+                              udpPeers[n] = peer
+                              n
+                          }
+                          relay?.send(RelayProto.frame(RelayProto.UDP_DATA, id, buf.copyOf(p.length)))
+                      } catch (e: Exception) {
+                          if (stopped) break
+                      }
+                  }
+              }
+          }
+          '''
+
+          REMOTE = r'''package com.pylux.stream.cloudstation
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.Toast
+          import com.metallic.chiaki.common.ManualHost
+          import com.metallic.chiaki.common.ManualHostDao
+          import com.metallic.chiaki.common.MacAddress
+          import com.metallic.chiaki.common.RegisteredHost
+          import com.metallic.chiaki.common.getDatabase
+          import com.metallic.chiaki.lib.Target
+          import org.json.JSONObject
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          fun csBytesToHex(b: ByteArray): String {
+              val sb = StringBuilder()
+              for (x in b) sb.append(String.format("%02x", x.toInt() and 0xFF))
+              return sb.toString()
+          }
+
+          fun csHexToBytes(s: String): ByteArray {
+              if (s.length % 2 != 0) return ByteArray(0)
+              val out = ByteArray(s.length / 2)
+              for (i in out.indices) out[i] = s.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+              return out
+          }
+
+          /** Remote player side: asks the server for a free host, opens the local proxy and adds a 127.0.0.1 console. */
+          object CloudStationRemote {
+              private val main = Handler(Looper.getMainLooper())
+
+              @Volatile
+              var active: Boolean = false
+                  private set
+
+              @Volatile
+              private var proxy: RelayClientProxy? = null
+
+              /** status() is called on the main thread. */
+              fun startRemote(ctx: Context, status: (String) -> Unit) {
+                  if (active) return
+                  val app = ctx.applicationContext
+                  Thread {
+                      val say: (String) -> Unit = { m -> main.post { status(m) } }
+                      say("Looking for a free host...")
+                      val r = CloudStationGate.request(app, "/api/connect", "POST", JSONObject(), true)
+                      if (r == null) {
+                          say("No connection")
+                          return@Thread
+                      }
+                      if (r.first == 503) {
+                          say("No host available right now")
+                          return@Thread
+                      }
+                      val ticket = r.second.optString("ticket", "")
+                      if (r.first != 200 || ticket.isEmpty()) {
+                          say(r.second.optString("error", "Error"))
+                          return@Thread
+                      }
+                      val c = CloudStationGate.request(app, "/api/console/" + ticket, "GET", null, true)
+                      if (c == null || c.first != 200) {
+                          say("The host has no console registered yet")
+                          return@Thread
+                      }
+                      val token = CloudStationGate.token(app)
+                      if (token == null) {
+                          say("Not signed in")
+                          return@Thread
+                      }
+                      val p = RelayClientProxy(token, ticket) { reason ->
+                          main.post { remoteClosed(app, reason, status) }
+                      }
+                      try {
+                          p.start()
+                      } catch (e: Exception) {
+                          say("Could not open the local ports")
+                          return@Thread
+                      }
+                      proxy = p
+                      active = true
+                      val ok = try {
+                          addConsole(app, c.second)
+                          true
+                      } catch (e: Exception) {
+                          Log.e("CloudStation", "addConsole failed", e)
+                          false
+                      }
+                      say(if (ok) "Ready: tap the 127.0.0.1 console in the list" else "Connected, but the console could not be added")
+                  }.start()
+              }
+
+              fun stopRemote(ctx: Context) {
+                  val app = ctx.applicationContext
+                  proxy?.stop()
+                  proxy = null
+                  active = false
+                  Thread { removeConsole(app) }.start()
+              }
+
+              private fun remoteClosed(app: Context, reason: String, status: (String) -> Unit) {
+                  proxy?.stop()
+                  proxy = null
+                  active = false
+                  Thread { removeConsole(app) }.start()
+                  if (reason == "access revoked") {
+                      CloudStationGate.revoke(app, "banned")
+                  } else {
+                      status("Remote session ended (" + reason + ")")
+                  }
+              }
+
+              private fun addConsole(app: Context, j: JSONObject) {
+                  val db = getDatabase(app)
+                  val regDao = db.registeredHostDao()
+                  val manualDao = db.manualHostDao()
+                  val mac = MacAddress(java.lang.Long.parseLong(j.optString("mac", "0"), 16))
+                  val existing: RegisteredHost? = regDao.getByMac(mac).blockingGet()
+                  val regId: Long = if (existing != null) {
+                      existing.id
+                  } else {
+                      val reg = RegisteredHost(
+                          target = Target.fromValue(j.optInt("target", 0)),
+                          apSsid = null,
+                          apBssid = null,
+                          apKey = null,
+                          apName = null,
+                          serverMac = mac,
+                          serverNickname = j.optString("nickname", "PS4"),
+                          rpRegistKey = csHexToBytes(j.optString("registKey", "")),
+                          rpKeyType = j.optInt("rpKeyType", 0),
+                          rpKey = csHexToBytes(j.optString("rpKey", ""))
+                      )
+                      regDao.insert(reg).blockingGet()
+                  }
+                  removeManual(manualDao)
+                  manualDao.insert(ManualHost(host = "127.0.0.1", registeredHost = regId)).blockingAwait()
+              }
+
+              private fun removeConsole(app: Context) {
+                  try {
+                      removeManual(getDatabase(app).manualHostDao())
+                  } catch (e: Exception) {
+                      Log.e("CloudStation", "removeConsole failed", e)
+                  }
+              }
+
+              private fun removeManual(dao: ManualHostDao) {
+                  val list = dao.getAll().blockingFirst()
+                  for (m in list) {
+                      if (m.host == "127.0.0.1") dao.delete(m).blockingAwait()
+                  }
+              }
+          }
+
+          /** Host side (owner's phone next to the PS4). */
+          object HostMode {
+              private val main = Handler(Looper.getMainLooper())
+
+              @Volatile
+              var running: Boolean = false
+                  private set
+
+              @Volatile
+              var status: String = "Stopped"
+                  private set
+
+              @Volatile
+              var consoleStatus: String = ""
+                  private set
+
+              @Volatile
+              var listener: (() -> Unit)? = null
+
+              private var host: RelayHost? = null
+
+              private fun setStatus(s: String) {
+                  status = s
+                  main.post { listener?.invoke() }
+              }
+
+              private fun setConsole(s: String) {
+                  consoleStatus = s
+                  main.post { listener?.invoke() }
+              }
+
+              fun start(ctx: Context, hostKey: String, ps4Ip: String) {
+                  stop()
+                  val h = RelayHost(ps4Ip, hostKey) { s -> setStatus(s) }
+                  host = h
+                  running = true
+                  h.start()
+                  uploadConsole(ctx.applicationContext, hostKey)
+              }
+
+              fun stop() {
+                  host?.stop()
+                  host = null
+                  running = false
+              }
+
+              /** Sends the registered PS4's credentials to the server so remote players can be given them. */
+              private fun uploadConsole(app: Context, hostKey: String) {
+                  setConsole("Sharing console...")
+                  Thread {
+                      try {
+                          val list = getDatabase(app).registeredHostDao().getAll().blockingFirst()
+                          val reg = list.firstOrNull { it.target.value < 1000000 } ?: list.firstOrNull()
+                          if (reg == null) {
+                              setConsole("No registered console found. Register your PS4 in the app first.")
+                              return@Thread
+                          }
+                          val name = reg.serverNickname ?: "PS4"
+                          val body = JSONObject()
+                          body.put("nickname", name)
+                          body.put("mac", String.format("%012x", reg.serverMac.value and 0xFFFFFFFFFFFFL))
+                          body.put("target", reg.target.value)
+                          body.put("registKey", csBytesToHex(reg.rpRegistKey))
+                          body.put("rpKey", csBytesToHex(reg.rpKey))
+                          body.put("rpKeyType", reg.rpKeyType)
+                          val conn = URL(CloudStationGate.SERVER + "/host/console").openConnection() as HttpURLConnection
+                          conn.requestMethod = "POST"
+                          conn.connectTimeout = 60000
+                          conn.readTimeout = 60000
+                          conn.setRequestProperty("Content-Type", "application/json")
+                          conn.setRequestProperty("x-host-key", hostKey)
+                          conn.doOutput = true
+                          val w = OutputStreamWriter(conn.outputStream, Charsets.UTF_8)
+                          w.write(body.toString())
+                          w.close()
+                          val code = conn.responseCode
+                          conn.disconnect()
+                          setConsole(if (code == 200) "Console shared: " + name else "Could not share the console (" + code + ")")
+                      } catch (e: Exception) {
+                          Log.e("CloudStation", "uploadConsole failed", e)
+                          setConsole("Could not share the console")
+                      }
+                  }.start()
+              }
+          }
+
+          /** Two small buttons (Remote / Host) shown on top of the main screen. */
+          object CloudStationOverlay {
+              fun attach(activity: Activity) {
+                  val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
+                  if (content.findViewWithTag<View>("cs_overlay") != null) return
+                  val dp = activity.resources.displayMetrics.density
+                  val box = LinearLayout(activity)
+                  box.tag = "cs_overlay"
+                  box.orientation = LinearLayout.HORIZONTAL
+
+                  val remote = Button(activity)
+                  remote.text = if (CloudStationRemote.active) "Stop remote" else "Remote"
+                  remote.setOnClickListener {
+                      if (CloudStationRemote.active) {
+                          CloudStationRemote.stopRemote(activity)
+                          remote.text = "Remote"
+                          Toast.makeText(activity, "Remote stopped", Toast.LENGTH_SHORT).show()
+                      } else {
+                          remote.isEnabled = false
+                          CloudStationRemote.startRemote(activity) { msg ->
+                              Toast.makeText(activity, msg, Toast.LENGTH_LONG).show()
+                              remote.text = if (CloudStationRemote.active) "Stop remote" else "Remote"
+                              remote.isEnabled = true
+                          }
+                      }
+                  }
+                  box.addView(remote)
+
+                  val host = Button(activity)
+                  host.text = "Host"
+                  host.setOnClickListener {
+                      activity.startActivity(Intent(activity, HostModeActivity::class.java))
+                  }
+                  box.addView(host)
+
+                  val lp = FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      Gravity.BOTTOM or Gravity.END
+                  )
+                  val m = (16 * dp).toInt()
+                  lp.setMargins(0, 0, m, m)
+                  content.addView(box, lp)
+              }
+          }
+          '''
+
+          HOSTACT = r'''package com.pylux.stream.cloudstation
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class HostModeActivity : Activity() {
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private lateinit var statusView: TextView
+              private lateinit var consoleView: TextView
+              private lateinit var button: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val prefs = getSharedPreferences("cloudstation_host", MODE_PRIVATE)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.rgb(2, 9, 23))
+                  root.setPadding(dp(24), dp(56), dp(24), dp(24))
+
+                  val title = TextView(this)
+                  title.text = "Host mode"
+                  title.textSize = 26f
+                  title.setTextColor(Color.WHITE)
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  title.gravity = Gravity.CENTER
+                  root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  val keyInput = EditText(this)
+                  keyInput.hint = "Host key"
+                  keyInput.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  keyInput.setTextColor(Color.WHITE)
+                  keyInput.setHintTextColor(Color.GRAY)
+                  keyInput.setText(prefs.getString("hostKey", ""))
+                  val keyLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  keyLp.topMargin = dp(24)
+                  root.addView(keyInput, keyLp)
+
+                  val ipInput = EditText(this)
+                  ipInput.hint = "PS4 IP address"
+                  ipInput.inputType = InputType.TYPE_CLASS_TEXT
+                  ipInput.setTextColor(Color.WHITE)
+                  ipInput.setHintTextColor(Color.GRAY)
+                  ipInput.setText(prefs.getString("ps4Ip", ""))
+                  root.addView(ipInput, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  statusView = TextView(this)
+                  statusView.setTextColor(Color.WHITE)
+                  statusView.textSize = 16f
+                  val statusLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  statusLp.topMargin = dp(20)
+                  root.addView(statusView, statusLp)
+
+                  consoleView = TextView(this)
+                  consoleView.setTextColor(Color.LTGRAY)
+                  consoleView.textSize = 13f
+                  root.addView(consoleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  button = Button(this)
+                  val buttonLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  buttonLp.topMargin = dp(20)
+                  button.setOnClickListener {
+                      if (HostMode.running) {
+                          HostMode.stop()
+                      } else {
+                          val key = keyInput.text.toString().trim()
+                          val ip = ipInput.text.toString().trim()
+                          if (key.isNotEmpty() && ip.isNotEmpty()) {
+                              prefs.edit().putString("hostKey", key).putString("ps4Ip", ip).apply()
+                              HostMode.start(this, key, ip)
+                          }
+                      }
+                      refresh()
+                  }
+                  root.addView(button, buttonLp)
+
+                  val note = TextView(this)
+                  note.text = "Keep this phone plugged in and the app open while hosting."
+                  note.setTextColor(Color.GRAY)
+                  note.textSize = 12f
+                  val noteLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  noteLp.topMargin = dp(12)
+                  root.addView(note, noteLp)
+
+                  setContentView(root)
+                  HostMode.listener = { refresh() }
+                  refresh()
+              }
+
+              private fun refresh() {
+                  statusView.text = HostMode.status
+                  consoleView.text = HostMode.consoleStatus
+                  button.text = if (HostMode.running) "Stop hosting" else "Start hosting"
+              }
+
+              override fun onDestroy() {
+                  HostMode.listener = null
+                  super.onDestroy()
+              }
+          }
+          '''
+
+          for name, text in (("Relay.kt", RELAY), ("CloudStationRemote.kt", REMOTE), ("HostModeActivity.kt", HOSTACT)):
+              open(os.path.join(src_dir, name), "w", encoding="utf-8").write(text)
+              print("wrote", name)
+
+          # ---- gate: make request/token reachable and attach the overlay on the main screen ----
+          gate_path = os.path.join(src_dir, "CloudStationGate.kt")
+          g = open(gate_path, encoding="utf-8").read()
+          g = g.replace("    private fun token(ctx: Context): String? =", "    internal fun token(ctx: Context): String? =", 1)
+          g = g.replace("    private fun request(ctx: Context, path: String", "    internal fun request(ctx: Context, path: String", 1)
+          old = "            override fun onActivityResumed(activity: Activity) {}\n"
+          new = ("            override fun onActivityResumed(activity: Activity) {\n"
+                 "                if (activity.javaClass.simpleName == \"MainActivity\") CloudStationOverlay.attach(activity)\n"
+                 "            }\n")
+          if old in g:
+              g = g.replace(old, new, 1)
+          elif "CloudStationOverlay" not in g:
+              print("ERROR: could not hook the overlay into the gate")
+              sys.exit(1)
+          open(gate_path, "w", encoding="utf-8").write(g)
+          print("gate patched")
+
+          # ---- manifest: register HostModeActivity ----
+          man = open(app_manifest, encoding="utf-8").read()
+          if "HostModeActivity" not in man:
+              snippet = (
+                  '        <activity\n'
+                  '            android:name="com.pylux.stream.cloudstation.HostModeActivity"\n'
+                  '            android:exported="false"\n'
+                  '            android:theme="@android:style/Theme.Material.NoActionBar" />\n'
+              )
+              idx = man.rfind("</application>")
+              if idx < 0:
+                  print("ERROR: </application> not found")
+                  sys.exit(1)
+              man = man[:idx] + snippet + man[idx:]
+              open(app_manifest, "w", encoding="utf-8").write(man)
+              print("manifest patched")
+
+          # ---- OkHttp dependency (only if the app does not have it yet) ----
+          build_file = None
+          for n in ("build.gradle.kts", "build.gradle"):
+              cand = os.path.join(module_root, n)
+              if os.path.isfile(cand):
+                  build_file = cand
+                  break
+          if not build_file:
+              print("ERROR: no build.gradle(.kts) found in", module_root)
+              sys.exit(1)
+          b = open(build_file, encoding="utf-8").read()
+          if "okhttp" in b.lower():
+              print("OkHttp already declared in", build_file)
+          else:
+              m = re.search(r"(?m)^dependencies\s*\{[ \t]*\r?\n", b)
+              if not m:
+                  print("ERROR: no dependencies block in", build_file)
+                  sys.exit(1)
+              b = b[:m.end()] + '    implementation("com.squareup.okhttp3:okhttp:4.12.0")\n' + b[m.end():]
+              open(build_file, "w", encoding="utf-8").write(b)
+              print("OkHttp dependency added to", build_file)
+          PY
+
       # Count hours only while a stream is running (3 small lines added to StreamSession.kt at build time).
       - name: Hook hours into StreamSession
         run: |
