@@ -1238,10 +1238,10 @@ jobs:
                   val lp = FrameLayout.LayoutParams(
                       ViewGroup.LayoutParams.WRAP_CONTENT,
                       ViewGroup.LayoutParams.WRAP_CONTENT,
-                      Gravity.BOTTOM or Gravity.END
+                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
                   )
                   val m = (16 * dp).toInt()
-                  lp.setMargins(0, 0, m, m)
+                  lp.setMargins(0, 0, 0, m)
                   content.addView(box, lp)
               }
           }
